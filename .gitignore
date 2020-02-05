@@ -1,0 +1,9 @@
+cmake-build*
+.idea
+*~
+*.bak
+*.so
+*.dll
+*.lib
+*.o
+*.a

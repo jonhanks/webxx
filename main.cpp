@@ -16,9 +16,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
 #include <algorithm>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <boost/asio.hpp>
@@ -166,20 +168,6 @@ namespace webxx
             msg_ = parser.get();
             dispatch_read();
         }
-        void read_request_old()
-        {
-            boost::beast::http::async_read<>(s_,
-                read_buf_,
-                msg_,
-                [self=shared_from_this()](const boost::system::error_code& ec, std::size_t bytes_transferred)
-            {
-                if (ec)
-                {
-                    return;
-                }
-                self->dispatch_read();
-            });
-        }
 
         void dispatch_read()
         {
@@ -207,17 +195,21 @@ namespace webxx
     class Server
     {
     public:
-        Server() : context_(std::make_shared<boost::asio::io_context>()),
-        acceptor_(*context_, boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), 9000))
+        explicit Server(int threads = 1) : contexts_(create_contexts(threads)),
+        work_(create_work_guard(contexts_)),
+        threads_(threads),
+        acceptor_(*(contexts_[0]), boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), 9000))
         {}
 
         void run()
         {
-            boost::fibers::use_scheduling_algorithm<boost::fibers::asio::round_robin>(context_);
-            boost::fibers::fiber([this]() {
-                accept_loop();
-            }).detach();
-            context_->run();
+            for (int i = 1; i < contexts_.size(); ++i)
+            {
+                threads_[i] = std::thread([this, i](){
+                    this->run_thread(i);
+                });
+            }
+            run_thread(0);
         }
 
         Router& router()
@@ -226,12 +218,52 @@ namespace webxx
         }
 
     private:
+        using acceptor_type = boost::asio::ip::tcp::acceptor;
+        using context_ptr = std::shared_ptr<io_context>;
+        using work_guard = boost::asio::executor_work_guard<io_context::executor_type>;
+
+        void run_thread(int n)
+        {
+            boost::fibers::use_scheduling_algorithm<boost::fibers::asio::round_robin>(contexts_[n]);
+
+            if (n == 0)
+            {
+                boost::fibers::fiber([this]() {
+                    accept_loop();
+                }).detach();
+            }
+            contexts_[n]->run();
+        }
+
+        static std::vector<context_ptr> create_contexts(int count)
+        {
+            std::vector<context_ptr> ctxs;
+            ctxs.reserve(count);
+            for (auto i = 0; i < count; ++i)
+            {
+                ctxs.emplace_back(std::make_shared<io_context>());
+            }
+            return ctxs;
+        }
+
+        static std::vector<work_guard> create_work_guard(std::vector<context_ptr>& ctxs)
+        {
+            std::vector<work_guard> guards;
+            guards.reserve(ctxs.size());
+            std::for_each(ctxs.begin(), ctxs.end(), [&guards](context_ptr& ctx) {
+                guards.emplace_back(boost::asio::make_work_guard(*ctx));
+            });
+            return guards;
+        }
+
         void
         accept_loop()
         {
+            int selector = 0;
+            int max = contexts_.size();
             while (true)
             {
-                auto conn = std::make_shared<Connection>(*context_, router_);
+                auto conn = std::make_shared<Connection>(*contexts_[selector], router_);
                 boost::system::error_code ec;
                 acceptor_.async_accept(conn->socket(),
                     boost::fibers::asio::yield[ec]);
@@ -239,15 +271,28 @@ namespace webxx
                 {
                     throw boost::system::system_error( ec );
                 }
-                boost::fibers::fiber([conn]() {
-                    conn->run();
-                } ).detach();
+
+                contexts_[selector]->post([conn=std::move(conn)]() mutable
+                {
+                    try {
+                        boost::fibers::fiber([conn=std::move(conn)]() mutable {
+                            conn->run();
+                        }).detach();
+                    }
+                    catch(...)
+                    {
+                    }
+                });
+
+                selector++;
+                selector %= max;
             }
         }
 
-        using acceptor_type = boost::asio::ip::tcp::acceptor;
 
-        std::shared_ptr<io_context> context_;
+        std::vector< context_ptr > contexts_;
+        std::vector< boost::asio::executor_work_guard<io_context::executor_type> > work_;
+        std::vector< std::thread > threads_;
         acceptor_type acceptor_;
         Router router_;
     };
@@ -259,8 +304,11 @@ namespace webxx
 class StaticRoute : public webxx::Route
 {
 public:
-    StaticRoute(boost::beast::http::verb method, std::string path):
-    method_{method}, path_{std::move(path)} {}
+    using handler_type = std::function<void(webxx::Connection&)>;
+
+    StaticRoute(boost::beast::http::verb method, std::string path, handler_type&& handler):
+    method_{method}, path_{std::move(path)}, handler_{std::move(handler)} {}
+    StaticRoute(StaticRoute&& other) = default;
     ~StaticRoute() override = default;
 
     bool matches(boost::beast::http::verb method, boost::string_view path) override
@@ -268,47 +316,89 @@ public:
         return method == method_ && path == path_;
     }
 
-    void operator()(webxx::Connection &conn) override
+    void operator()(webxx::Connection& conn) override
     {
-        namespace http = boost::beast::http;
-
-        std::string body = "<html><body><p>The index!</p></body></html>";
-
-        http::response<http::string_body> resp;
-        resp.version(11);
-        resp.result(http::status::ok);
-        resp.set(http::field::content_length, body.size());
-        resp.body() = body;
-        boost::system::error_code ec;
-
-        boost::beast::http::response_serializer<boost::beast::http::string_body> sr{resp};
-        do {
-            sr.next(ec,[&sr, &conn](boost::system::error_code& ec, const auto & buffer)
-            {
-                ec.assign(0, ec.category());
-                boost::system::error_code wec;
-                boost::asio::async_write(conn.socket(), buffer,
-                                         boost::fibers::asio::yield[wec]);
-                if (wec)
-                {
-                    throw boost::system::error_code( ec );
-                }
-                sr.consume(boost::asio::buffer_size(buffer));
-            });
-        }
-        while (! ec && ! sr.is_done() );
+        handler_(conn);
     }
 
-public:
+private:
     boost::beast::http::verb method_;
     std::string path_;
+    handler_type handler_;
 };
+
+void index_handler(webxx::Connection &conn)
+{
+    namespace http = boost::beast::http;
+
+    std::cout << "Answering request in thread" << std::this_thread::get_id() << std::endl;
+
+    std::string body = "<html><body><p>The index!</p></body></html>";
+
+    http::response<http::string_body> resp;
+    resp.version(11);
+    resp.result(http::status::ok);
+    resp.set(http::field::content_length, body.size());
+    resp.body() = body;
+    boost::system::error_code ec;
+
+    boost::beast::http::response_serializer<boost::beast::http::string_body> sr{resp};
+    do
+    {
+        sr.next(ec, [&sr, &conn](boost::system::error_code &ec, const auto &buffer)
+        {
+            ec.assign(0, ec.category());
+            boost::system::error_code wec;
+            boost::asio::async_write(conn.socket(), buffer,
+                                     boost::fibers::asio::yield[wec]);
+            if (wec)
+            {
+                throw boost::system::error_code(ec);
+            }
+            sr.consume(boost::asio::buffer_size(buffer));
+        });
+    } while (!ec && !sr.is_done());
+}
+
+void not_found(webxx::Connection &conn)
+{
+    namespace http = boost::beast::http;
+
+    std::cout << "Not found request in thread" << std::this_thread::get_id() << std::endl;
+
+    std::string body = "<html><body><p>Not Found!</p></body></html>";
+
+    http::response<http::string_body> resp;
+    resp.version(11);
+    resp.result(http::status::not_found);
+    resp.set(http::field::content_length, body.size());
+    resp.body() = body;
+    boost::system::error_code ec;
+
+    boost::beast::http::response_serializer<boost::beast::http::string_body> sr{resp};
+    do
+    {
+        sr.next(ec, [&sr, &conn](boost::system::error_code &ec, const auto &buffer)
+        {
+            ec.assign(0, ec.category());
+            boost::system::error_code wec;
+            boost::asio::async_write(conn.socket(), buffer,
+                                     boost::fibers::asio::yield[wec]);
+            if (wec)
+            {
+                throw boost::system::error_code(ec);
+            }
+            sr.consume(boost::asio::buffer_size(buffer));
+        });
+    } while (!ec && !sr.is_done());
+}
 
 int main()
 {
   std::cout << "Hello, World!" << std::endl;
-  webxx::Server server;
-  server.router().add<StaticRoute>(boost::beast::http::verb::get, "/");
+  webxx::Server server(3);
+  server.router().add<StaticRoute>(boost::beast::http::verb::get, "/", index_handler);
+  server.router().add<StaticRoute>(boost::beast::http::verb::get, "/favicon.ico", not_found);
   server.run();
   return 0;
 }
